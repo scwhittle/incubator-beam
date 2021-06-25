@@ -92,6 +92,7 @@ import org.apache.beam.sdk.testutils.metrics.MetricsReader;
 import org.apache.beam.sdk.transforms.DoFn;
 import org.apache.beam.sdk.transforms.MapElements;
 import org.apache.beam.sdk.transforms.ParDo;
+import org.apache.beam.sdk.transforms.SerializableFunction;
 import org.apache.beam.sdk.util.CoderUtils;
 import org.apache.beam.sdk.values.KV;
 import org.apache.beam.sdk.values.PCollection;
@@ -896,31 +897,29 @@ public class NexmarkLauncher<OptionT extends NexmarkOptions> {
 
   /** Send {@code formattedResults} to BigQuery. */
   private void sinkResultsToBigQuery(
-      PCollection<String> formattedResults, long now, String version) {
-    String tableSpec = NexmarkUtils.tableSpec(options, queryName, now, version);
+      PCollection<TimestampedValue<KnownSize>> results, long now) {
+    String tableSpec = NexmarkUtils.tableSpec(options, queryName, now);
     TableSchema tableSchema =
         new TableSchema()
             .setFields(
                 ImmutableList.of(
                     new TableFieldSchema().setName("result").setType("STRING"),
-                    new TableFieldSchema()
-                        .setName("records")
-                        .setMode("REPEATED")
-                        .setType("RECORD")
-                        .setFields(
-                            ImmutableList.of(
-                                new TableFieldSchema().setName("index").setType("INTEGER"),
-                                new TableFieldSchema().setName("value").setType("STRING")))));
+                    new TableFieldSchema().setName("timestamp").setType("INTEGER")));
     NexmarkUtils.console("Writing results to BigQuery table %s", tableSpec);
     BigQueryIO.Write io =
-        BigQueryIO.write()
+        BigQueryIO.<TimestampedValue<KnownSize>>write()
             .to(tableSpec)
             .withSchema(tableSchema)
+            .withFormatFunction(
+                (SerializableFunction<TimestampedValue<KnownSize>, TableRow>)
+                    result ->
+                        new TableRow()
+                            .set("result", result.getValue().toString())
+                            .set("timestamp", result.getTimestamp().getMillis()))
             .withCreateDisposition(BigQueryIO.Write.CreateDisposition.CREATE_IF_NEEDED)
-            .withWriteDisposition(BigQueryIO.Write.WriteDisposition.WRITE_APPEND);
-    formattedResults
-        .apply(queryName + ".StringToTableRow", ParDo.of(new StringToTableRow()))
-        .apply(queryName + ".WriteBigQueryResults", io);
+            .withWriteDisposition(BigQueryIO.Write.WriteDisposition.WRITE_APPEND)
+            .ignoreInsertIds();
+    results.apply(queryName + ".SimpleWriteBigQueryResults", io);
   }
 
   /** Creates or reuses PubSub topics and subscriptions as configured. */
@@ -1066,6 +1065,11 @@ public class NexmarkLauncher<OptionT extends NexmarkOptions> {
       return;
     }
 
+    if (configuration.sinkType == NexmarkUtils.SinkType.BIGQUERY) {
+      sinkResultsToBigQuery(results, now);
+      return;
+    }
+
     PCollection<String> formattedResults =
         results.apply(queryName + ".Format", NexmarkUtils.format(queryName));
     if (options.getLogResults()) {
@@ -1093,15 +1097,6 @@ public class NexmarkLauncher<OptionT extends NexmarkOptions> {
             "WARNING: with --sinkType=AVRO, actual query results will be discarded.");
         break;
       case BIGQUERY:
-        // Multiple BigQuery backends to mimic what most customers do.
-        PCollectionTuple res =
-            formattedResults.apply(
-                queryName + ".Partition",
-                ParDo.of(new PartitionDoFn()).withOutputTags(MAIN, TupleTagList.of(SIDE)));
-        sinkResultsToBigQuery(res.get(MAIN), now, "main");
-        sinkResultsToBigQuery(res.get(SIDE), now, "side");
-        sinkResultsToBigQuery(formattedResults, now, "copy");
-        break;
       case COUNT_ONLY:
         // Short-circuited above.
         throw new RuntimeException();
